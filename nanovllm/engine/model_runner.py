@@ -10,11 +10,17 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.logger import setup_logger, log_gpu_memory, log_tensor_shapes, timed_section
+
+logger = setup_logger(__name__)
 
 
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        logger.info(f"="*80)
+        logger.info(f"Initializing ModelRunner: rank={rank}")
+        
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -23,29 +29,53 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        logger.info(f"Setting up distributed training: world_size={self.world_size}, rank={rank}")
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
+        logger.info(f"Using device: cuda:{rank}")
+        
+        log_gpu_memory(logger, f"[Rank {rank}] Before model loading - ", rank)
+        
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
+        
+        logger.info(f"[Rank {rank}] Loading model: {config.model}")
+        logger.info(f"[Rank {rank}] Model config: num_layers={hf_config.num_hidden_layers}, "
+                   f"hidden_size={hf_config.hidden_size}, "
+                   f"num_attention_heads={hf_config.num_attention_heads}, "
+                   f"num_kv_heads={hf_config.num_key_value_heads}")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        logger.info(f"[Rank {rank}] Model loaded")
+        log_gpu_memory(logger, f"[Rank {rank}] After model loading - ", rank)
+        
         self.sampler = Sampler()
+        logger.info(f"[Rank {rank}] Running model warmup")
         self.warmup_model()
+        logger.info(f"[Rank {rank}] Allocating KV cache")
         self.allocate_kv_cache()
         if not self.enforce_eager:
+            logger.info(f"[Rank {rank}] Capturing CUDA graphs")
             self.capture_cudagraph()
+        else:
+            logger.info(f"[Rank {rank}] Running in eager mode (CUDA graphs disabled)")
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:
+                logger.info(f"[Rank {rank}] Creating shared memory for communication")
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
+                logger.info(f"[Rank {rank}] Connected to shared memory, entering worker loop")
                 self.loop()
+        
+        logger.info(f"[Rank {rank}] ModelRunner initialization complete")
+        logger.info(f"="*80)
 
     def exit(self):
         if self.world_size > 1:
@@ -104,18 +134,34 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        
+        logger.info(f"[Rank {self.rank}] GPU Memory before KV cache: "
+                   f"free={free/1024**3:.2f}GB, total={total/1024**3:.2f}GB, "
+                   f"used={used/1024**3:.2f}GB, peak={peak/1024**3:.2f}GB")
+        
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        
+        logger.info(f"[Rank {self.rank}] KV cache configuration: "
+                   f"num_kv_heads={num_kv_heads}, head_dim={head_dim}, "
+                   f"block_size={self.block_size}, block_bytes={block_bytes/1024**2:.2f}MB")
+        logger.info(f"[Rank {self.rank}] Allocating {config.num_kvcache_blocks} KV cache blocks, "
+                   f"total_size={config.num_kvcache_blocks * block_bytes / 1024**3:.2f}GB")
+        
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        logger.info(f"[Rank {self.rank}] KV cache tensor shape: {list(self.kv_cache.shape)}")
+        
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+        
+        log_gpu_memory(logger, f"[Rank {self.rank}] After KV cache allocation - ", self.rank)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -124,6 +170,8 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        logger.debug(f"[Rank {self.rank}] Preparing PREFILL batch: {len(seqs)} sequences")
+        
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -153,15 +201,28 @@ class ModelRunner:
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+            logger.debug(f"[Rank {self.rank}] Using prefix cache, block_tables shape: {list(block_tables.shape)}")
+        
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        
+        log_tensor_shapes(logger, {
+            "input_ids": input_ids,
+            "positions": positions,
+            "slot_mapping": slot_mapping,
+        }, f"[Rank {self.rank}] PREFILL tensors: ")
+        logger.debug(f"[Rank {self.rank}] PREFILL: max_seqlen_q={max_seqlen_q}, max_seqlen_k={max_seqlen_k}, "
+                    f"total_tokens={len(input_ids)}")
+        
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        logger.debug(f"[Rank {self.rank}] Preparing DECODE batch: {len(seqs)} sequences")
+        
         input_ids = []
         positions = []
         slot_mapping = []
@@ -171,11 +232,20 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+        
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
+        
+        log_tensor_shapes(logger, {
+            "input_ids": input_ids,
+            "positions": positions,
+            "context_lens": context_lens,
+            "block_tables": block_tables,
+        }, f"[Rank {self.rank}] DECODE tensors: ")
+        
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
@@ -206,9 +276,20 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        phase = "PREFILL" if is_prefill else "DECODE"
+        logger.debug(f"[Rank {self.rank}] Running {phase} for {len(seqs)} sequences")
+        
+        with timed_section(logger, f"[Rank {self.rank}] Prepare {phase}", log_level=10):  # DEBUG level
+            input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        
+        with timed_section(logger, f"[Rank {self.rank}] Model forward {phase}", log_level=10):
+            logits = self.run_model(input_ids, positions, is_prefill)
+        
+        if self.rank == 0:
+            log_tensor_shapes(logger, {"logits": logits}, f"[Rank {self.rank}] Output: ")
+        
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

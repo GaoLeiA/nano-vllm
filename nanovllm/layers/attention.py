@@ -5,6 +5,9 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+from nanovllm.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 
 @triton.jit
@@ -37,6 +40,7 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
+    logger.debug(f"Storing KV cache: N={N}, num_heads={num_heads}, head_dim={head_dim}, num_slots={N}")
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
@@ -59,17 +63,25 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        
+        logger.debug(f"Attention forward: is_prefill={context.is_prefill}, "
+                    f"q={list(q.shape)}, k={list(k.shape)}, v={list(v.shape)}")
+        
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
+                logger.debug(f"Using prefix cache in prefill: k_cache={list(k.shape)}, v_cache={list(v.shape)}")
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
+            logger.debug(f"Decode attention: k_cache={list(k_cache.shape)}, v_cache={list(v_cache.shape)}")
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 
                                         softmax_scale=self.scale, causal=True)
+        
+        logger.debug(f"Attention output: {list(o.shape)}")
         return o

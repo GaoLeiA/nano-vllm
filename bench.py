@@ -1,8 +1,16 @@
 import os
 import time
+import logging
 from random import randint, seed
 from nanovllm import LLM, SamplingParams
 # from vllm import LLM, SamplingParams
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 
 def main():
@@ -30,3 +38,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

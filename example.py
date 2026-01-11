@@ -1,6 +1,14 @@
 import os
+import logging
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
+
+# Setup logging to see detailed execution flow
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 
 def main():
@@ -31,3 +39,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
