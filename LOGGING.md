@@ -11,6 +11,25 @@ nano-vllm 现已添加全面的日志系统，可以追踪整个推理流程的�
 - **块管理** - KV cache块的分配和缓存命中
 - **执行时间** - 关键操作的耗时
 
+### 🎯 智能日志频率控制
+
+为了避免DECODE阶段产生过多重复日志，系统采用了智能频率控制：
+
+**INFO级别（默认）**：
+- PREFILL批次：每次都记录（较少发生）
+- DECODE批次：仅在关键时刻记录
+  - ✅ 第一个decode step
+  - ✅ 每10个step
+  - ✅ 批次大小改变时
+  - ✅ 发生序列抢占时
+- ModelRunner的详细信息（张量形状等）自动降级到DEBUG
+
+**DEBUG级别**：
+- 记录所有step的详细信息
+- 包括所有张量形状和中间结果
+
+这样可以保持日志简洁易读，同时在需要时仍能看到完整细节。
+
 ## 日志级别控制
 
 ### 方式1：环境变量（推荐）
@@ -101,22 +120,34 @@ from nanovllm import LLM, SamplingParams
 
 ### 4. Decode阶段（逐token生成）
 
+**INFO级别（简洁模式）**：
 ```
-[INFO] Scheduled DECODE batch: size=2, preempted=0, seqs=[seq_0(len=79), seq_1(len=79)]
+[INFO] Scheduled DECODE batch (step 1): size=2, preempted=0, seqs=[seq_0(len=79), seq_1(len=79)]
+... (步骤2-9：仅DEBUG级别记录)
+[INFO] Scheduled DECODE batch (step 10): size=2, preempted=0, seqs=[seq_0(len=88), seq_1(len=88)]
+... (步骤11-19：仅DEBUG级别记录)
+[INFO] Scheduled DECODE batch (step 20): size=2, preempted=0, seqs=[seq_0(len=98), seq_1(len=98)]
+```
+
+**DEBUG级别（详细模式）**：
+```
+[INFO] Scheduled DECODE batch (step 1): size=2, preempted=0, seqs=[seq_0(len=79), seq_1(len=79)]
 [DEBUG] [Rank 0] Preparing DECODE batch: 2 sequences
-[DEBUG] [Rank 0] DECODE tensors: input_ids=[2], positions=[2], 
-        context_lens=[2], block_tables=[2, 5]
+[DEBUG] [Rank 0] DECODE tensors: input_ids=[2], positions=[2], context_lens=[2], block_tables=[2, 5]
 [DEBUG] [START] [Rank 0] Model forward DECODE
 [DEBUG] Decode attention: k_cache=[2, 28, 512, 16, 2, 128], v_cache=[2, 28, 512, 16, 2, 128]
 [DEBUG] [END] [Rank 0] Model forward DECODE - Elapsed: XX.XXms
+[DEBUG] [Rank 0] Output: logits=[2, 151936]
+[DEBUG] Scheduled DECODE batch (step 2): size=2, preempted=0, seqs=[seq_0(len=80), seq_1(len=80)]
+... (每个step都有详细日志)
 ```
 
 **关键信息**：
-- Decode批次信息
-- 输入张量形状（每个序列一个token）
-- Context长度
-- KV cache的完整形状
-- Decode的耗时
+- Decode批次信息（周期性记录）
+- 输入张量形状（DEBUG级别）
+- Context长度（DEBUG级别）
+- KV cache的完整形状（DEBUG级别）
+- Decode的耗时（DEBUG级别）
 
 ### 5. 块管理
 

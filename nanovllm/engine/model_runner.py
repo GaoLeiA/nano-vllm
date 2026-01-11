@@ -221,6 +221,7 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        # Reduced to DEBUG level to avoid repetitive logs
         logger.debug(f"[Rank {self.rank}] Preparing DECODE batch: {len(seqs)} sequences")
         
         input_ids = []
@@ -239,12 +240,10 @@ class ModelRunner:
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         
-        log_tensor_shapes(logger, {
-            "input_ids": input_ids,
-            "positions": positions,
-            "context_lens": context_lens,
-            "block_tables": block_tables,
-        }, f"[Rank {self.rank}] DECODE tensors: ")
+        # Tensor shapes logged at DEBUG level to reduce verbosity
+        logger.debug(f"[Rank {self.rank}] DECODE tensors: input_ids={list(input_ids.shape)}, "
+                    f"positions={list(positions.shape)}, context_lens={list(context_lens.shape)}, "
+                    f"block_tables={list(block_tables.shape)}")
         
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
@@ -287,8 +286,9 @@ class ModelRunner:
         with timed_section(logger, f"[Rank {self.rank}] Model forward {phase}", log_level=10):
             logits = self.run_model(input_ids, positions, is_prefill)
         
+        # Output shapes at DEBUG level for decode to reduce log spam
         if self.rank == 0:
-            log_tensor_shapes(logger, {"logits": logits}, f"[Rank {self.rank}] Output: ")
+            logger.debug(f"[Rank {self.rank}] Output: logits={list(logits.shape)}")
         
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()

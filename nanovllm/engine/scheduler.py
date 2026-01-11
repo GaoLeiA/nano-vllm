@@ -19,6 +19,9 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        # Track decode steps to reduce logging frequency
+        self.decode_step_count = 0
+        self.last_batch_size = 0
         logger.info("Scheduler initialized")
 
     def is_finished(self):
@@ -73,9 +76,29 @@ class Scheduler:
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
         
-        seq_info = ', '.join([f"seq_{s.seq_id}(len={len(s)})" for s in scheduled_seqs])
-        logger.info(f"Scheduled DECODE batch: size={len(scheduled_seqs)}, "
-                   f"preempted={preempt_count}, seqs=[{seq_info}]")
+        # Smart logging: only log at key moments to reduce spam
+        self.decode_step_count += 1
+        batch_size_changed = len(scheduled_seqs) != self.last_batch_size
+        self.last_batch_size = len(scheduled_seqs)
+        
+        # Log at: first step, every 10 steps, when batch size changes, or if preempted
+        should_log_info = (
+            self.decode_step_count == 1 or 
+            self.decode_step_count % 10 == 0 or 
+            batch_size_changed or
+            preempt_count > 0
+        )
+        
+        if should_log_info:
+            seq_info = ', '.join([f"seq_{s.seq_id}(len={len(s)})" for s in scheduled_seqs])
+            logger.info(f"Scheduled DECODE batch (step {self.decode_step_count}): size={len(scheduled_seqs)}, "
+                       f"preempted={preempt_count}, seqs=[{seq_info}]")
+        else:
+            # Still log at DEBUG level for detailed debugging
+            seq_info = ', '.join([f"seq_{s.seq_id}(len={len(s)})" for s in scheduled_seqs])
+            logger.debug(f"Scheduled DECODE batch (step {self.decode_step_count}): size={len(scheduled_seqs)}, "
+                        f"preempted={preempt_count}, seqs=[{seq_info}]")
+        
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
